@@ -17,6 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -265,6 +266,20 @@ binder_status_t Redirect(AIBinder* local, transaction_code_t code, AParcel** in,
 
 binder_status_t HookedTransact(AIBinder* binder, transaction_code_t code, AParcel** in,
                                AParcel** out, binder_flags_t flags) {
+  // TEESIM_AVD_DIAG: prove whether keystore2's KeyMint traffic reaches this PLT hook at all.
+  // Logs the first N transactions with their interface descriptor, code and caller uid.
+  // Remove once the Android 16 x86_64 path is confirmed.
+  {
+    static std::atomic<uint32_t> diag_calls{0};
+    uint32_t diag_n = diag_calls.fetch_add(1, std::memory_order_relaxed);
+    if (diag_n < 512) {
+      const AIBinder_Class* diag_clazz = binder ? AIBinder_getClass(binder) : nullptr;
+      const char* diag_desc = diag_clazz ? AIBinder_Class_getDescriptor(diag_clazz) : nullptr;
+      LOGI("TEESIM_AVD_DIAG tx#%u code=%u desc=%s uid=%d keymint=%d", diag_n, code,
+           diag_desc ? diag_desc : "(null)",
+           static_cast<int>(AIBinder_getCallingUid()), IsKeyMintProxy(binder) ? 1 : 0);
+    }
+  }
   if (!tls_forwarding && in && *in) {
     // Deny a target app's remote-provisioning lookup so keystore2 attaches no real attest key. The
     // RKP resolution runs on this same binder thread (a current-thread tokio runtime block_on), while
