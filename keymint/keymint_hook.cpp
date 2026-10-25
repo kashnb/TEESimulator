@@ -460,6 +460,26 @@ static constexpr uint32_t kKeyMintGenerateKeyCode = 3;
 // alone -- see the handle gate below -- until a level cache exists).
 static constexpr int32_t kSecurityLevelTee = 1;
 
+// RemoteProvisioning interface keystore2 asks for an attest key through (same descriptor the
+// transact-hook path's IsRkpProvisioning matches). Denying getRegistration makes keystore2 fall back
+// to "no attest key", so our TA mints the chain from the keybox instead of appending a real one.
+static constexpr const char* kRkpDescriptor = "android.security.rkp.IRemoteProvisioning";
+
+// getRegistration is also issued by system processes during keystore init; killing those would break
+// boot. So the RKP denial fires only for these scope uids (in ADDITION to the teesim_is_target_uid
+// gate), matching the profile scope.
+static bool IsRkpScopeUid(int32_t uid) {
+  switch (uid) {
+    case 10144:
+    case 10147:
+    case 10218:
+    case 10221:
+      return true;
+    default:
+      return false;
+  }
+}
+
 // Serialises the phase-2 write-buffer rewrite (keystore2 is multi-threaded; ioctl frequency is low).
 static std::mutex g_ioctl_mu;
 
@@ -499,8 +519,7 @@ static bool HijackEnabled() {
 // True if the first <=512 bytes of a request's data region contain the UTF-16 (little-endian) encoding
 // of IKeyMintDevice::descriptor. We search rather than assume a fixed offset, so a work-source or
 // other interface-header prefix ahead of the token does not defeat the match.
-static bool DataHasKeyMintInterface(const uint8_t* data, size_t len) {
-  const char* desc = IKeyMintDevice::descriptor;
+static bool DataHasInterface(const uint8_t* data, size_t len, const char* desc) {
   const size_t dlen = desc ? std::strlen(desc) : 0;
   if (dlen == 0) return false;
   size_t scan = len < 512 ? len : 512;
@@ -517,6 +536,10 @@ static bool DataHasKeyMintInterface(const uint8_t* data, size_t len) {
   return false;
 }
 
+static bool DataHasKeyMintInterface(const uint8_t* data, size_t len) {
+  return DataHasInterface(data, len, IKeyMintDevice::descriptor);
+}
+
 static bool IsKnownKeyMintHandle(uint32_t handle) {
   std::lock_guard<std::mutex> lk(g_km_mu);
   auto it = g_km_handles.find(handle);
@@ -526,6 +549,18 @@ static bool IsKnownKeyMintHandle(uint32_t handle) {
 // Validity gate for a transaction's data region before we dereference tr.data.ptr.buffer.
 static bool DataRegionSane(const struct binder_transaction_data& tr) {
   return tr.data.ptr.buffer != 0 && tr.data_size > 0 && tr.data_size < (1u << 20);
+}
+
+// True if this transaction is an RKP getRegistration we should deny: it carries the RemoteProvisioning
+// interface token, is not one-way, and the caller is both a target uid and in the hardcoded RKP scope
+// set. Reads only the request data; no side effects.
+static bool IsRkpDenyTransaction(const struct binder_transaction_data& tr) {
+  if (tr.flags & TF_ONE_WAY) return false;
+  if (!DataRegionSane(tr)) return false;
+  const uint8_t* d = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(tr.data.ptr.buffer));
+  if (!DataHasInterface(d, tr.data_size, kRkpDescriptor)) return false;
+  const int32_t uid = static_cast<int32_t>(AIBinder_getCallingUid());
+  return IsRkpScopeUid(uid) && teesim_is_target_uid(uid);
 }
 
 // Build an NDK AParcel bound to `local` holding the raw request bytes, dispatch generateKey to the
@@ -634,6 +669,12 @@ static void ScanKeyMintCache(const struct binder_write_read* bwr, bool do_probe)
       }
     }
     if (!do_probe) continue;
+    // RKP getRegistration (phase 1, switch off): it WOULD be denied in phase 2; log only, never modify.
+    if (IsRkpDenyTransaction(c.tr)) {
+      LOGI("DIAG hijack: rkp getRegistration seen (switch off) uid=%d code=%u handle=%u",
+           static_cast<int>(AIBinder_getCallingUid()), c.tr.code, c.tr.target.handle);
+      continue;
+    }
     if (c.tr.code != kKeyMintGenerateKeyCode || (c.tr.flags & TF_ONE_WAY)) continue;
     if (!IsKnownKeyMintHandle(c.tr.target.handle)) continue;
     if (!teesim_is_target_uid(static_cast<int32_t>(AIBinder_getCallingUid()))) continue;
@@ -664,10 +705,102 @@ static void RewriteWriteBuffer(struct binder_write_read* bwr, const std::vector<
   bwr->write_consumed = w;
 }
 
+// Build the GENERATE reply: dispatch the request to the local TA and marshal its reply parcel into a
+// freshly malloc'd buffer (caller owns it). Returns false on any failure.
+static bool BuildGenerateReply(const struct binder_transaction_data& tr, void** reply_out,
+                               int32_t* len_out) {
+  *reply_out = nullptr;
+  *len_out = 0;
+  AIBinder* local = GetLocalTee();
+  if (!local) return false;
+  AParcel* out = nullptr;
+  if (CallLocalGenerateKey(local, tr, &out) != STATUS_OK || out == nullptr) {
+    if (out) AParcel_delete(out);
+    return false;
+  }
+  int32_t n = AParcel_getDataSize(out);
+  if (n < 0) { AParcel_delete(out); return false; }
+  void* buf = std::malloc(n > 0 ? static_cast<size_t>(n) : 1);
+  bool ok = buf != nullptr &&
+            (n == 0 || AParcel_marshal(out, static_cast<uint8_t*>(buf), 0,
+                                       static_cast<size_t>(n)) == STATUS_OK);
+  AParcel_delete(out);
+  if (!ok) { std::free(buf); return false; }
+  *reply_out = buf;
+  *len_out = n;
+  return true;
+}
+
+// Build the RKP-denial reply: an AIDL failure status header (EX_UNSUPPORTED_OPERATION + "rkp denied")
+// marshalled into a freshly malloc'd buffer (caller owns it). We use the NDK's own status writer
+// (AStatus_* + AParcel_writeStatusHeader) so the on-wire bytes are exactly what keystore2's binder-rs
+// client parses for a failed transact: int32 exception code (-7) followed by a String16 message. For a
+// non-EX_NONE status no return values follow, which is correct for a denied getRegistration.
+static bool BuildRkpDenyReply(void** reply_out, int32_t* len_out) {
+  *reply_out = nullptr;
+  *len_out = 0;
+  AStatus* st = AStatus_fromExceptionCodeWithMessage(EX_UNSUPPORTED_OPERATION, "rkp denied");
+  if (!st) return false;
+  AParcel* p = AParcel_create();
+  if (!p) { AStatus_delete(st); return false; }
+  binder_status_t ws = AParcel_writeStatusHeader(p, st);
+  AStatus_delete(st);
+  if (ws != STATUS_OK) { AParcel_delete(p); return false; }
+  int32_t n = AParcel_getDataSize(p);
+  if (n < 0) { AParcel_delete(p); return false; }
+  void* buf = std::malloc(n > 0 ? static_cast<size_t>(n) : 1);
+  bool ok = buf != nullptr &&
+            (n == 0 || AParcel_marshal(p, static_cast<uint8_t*>(buf), 0,
+                                       static_cast<size_t>(n)) == STATUS_OK);
+  AParcel_delete(p);
+  if (!ok) { std::free(buf); return false; }
+  *reply_out = buf;
+  *len_out = n;
+  return true;
+}
+
+// Compose a synthesised BR_REPLY into the read buffer carrying `reply`/`out_len` (an out-of-line
+// malloc'd buffer we own, already registered in g_synth_bufs), swallow the client's stale free-buffers,
+// and mark the whole write consumed. The read buffer only needs the command header: the reply data is
+// out-of-line, referenced by the pointer below, exactly as the kernel delivers a real reply.
+static void EmitSynthReply(struct binder_write_read* bwr, void* reply, int32_t out_len,
+                           uint32_t sender_euid, const std::vector<uintptr_t>& our_frees) {
+  uint8_t* rb = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(bwr->read_buffer));
+  uint32_t br = BR_REPLY;
+  std::memcpy(rb, &br, sizeof(br));
+  struct binder_transaction_data rep;
+  std::memset(&rep, 0, sizeof(rep));
+  rep.code = 0;      // BR_REPLY carries no method code
+  rep.flags = 0;     // not oneway, no fds
+  rep.sender_euid = sender_euid;  // preserve the caller's identity
+  rep.data_size = out_len;
+  rep.offsets_size = 0;
+  rep.data.ptr.buffer = static_cast<binder_uintptr_t>(reinterpret_cast<uintptr_t>(reply));
+  rep.data.ptr.offsets = 0;
+  std::memcpy(rb + sizeof(uint32_t), &rep, sizeof(rep));
+  bwr->read_consumed = sizeof(uint32_t) + sizeof(struct binder_transaction_data);
+  for (uintptr_t p : our_frees) {
+    std::lock_guard<std::mutex> lk(g_synth_mu);
+    if (g_synth_bufs.erase(p)) std::free(reinterpret_cast<void*>(p));
+  }
+  bwr->write_consumed = bwr->write_size;  // we consumed the whole write
+}
+
+// What kind of takeover a transaction qualifies for.
+enum class HijackKind { kNone, kGenerateKey, kRkpDeny };
+
+// True if this transaction is a target-app KeyMint generateKey we should take over.
+static bool IsGenerateKeyHijack(const struct binder_transaction_data& tr) {
+  return !(tr.flags & TF_ONE_WAY) && DataRegionSane(tr) && tr.code == kKeyMintGenerateKeyCode &&
+         IsKnownKeyMintHandle(tr.target.handle) &&
+         teesim_is_target_uid(static_cast<int32_t>(AIBinder_getCallingUid()));
+}
+
 // Attempt phase-2 takeover. Caller holds g_ioctl_mu. Safe-by-construction: we only suppress when the
-// write buffer is nothing but (optionally) our own BC_FREE_BUFFERs plus exactly one target-app
-// generateKey whose reply we can synthesise into the read buffer; any other shape either just excises
-// our stale free-buffers (so the kernel never sees a pointer it rejects) or is forwarded untouched.
+// write buffer is nothing but (optionally) our own BC_FREE_BUFFERs plus exactly one transaction we take
+// over -- a target-app generateKey (reply = TA result) or an RKP getRegistration (reply = AIDL failure)
+// -- whose reply we can synthesise into the read buffer; any other shape either just excises our stale
+// free-buffers (so the kernel never sees a pointer it rejects) or is forwarded untouched.
 static HijackResult TryHijack(struct binder_write_read* bwr) {
   if (!bwr || bwr->write_buffer == 0 || bwr->write_size == 0) return HijackResult::kForwardUnchanged;
   const uint8_t* buf = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(bwr->write_buffer));
@@ -678,8 +811,9 @@ static HijackResult TryHijack(struct binder_write_read* bwr) {
 
   std::vector<uintptr_t> our_frees;
   std::vector<size_t> keep;  // indices to retain if we end up only excising frees
-  int gen_idx = -1;
-  int other_cmds = 0;  // non-free, non-the-one-gen commands
+  int hj_idx = -1;
+  HijackKind hj_kind = HijackKind::kNone;
+  int other_cmds = 0;  // non-free, non-the-one-hijacked commands
 
   for (size_t i = 0; i < cmds.size(); ++i) {
     const WbCmd& c = cmds[i];
@@ -691,12 +825,17 @@ static HijackResult TryHijack(struct binder_write_read* bwr) {
       ++other_cmds;
       continue;
     }
-    if (c.cmd == BC_TRANSACTION && c.has_tr && gen_idx < 0 &&
-        c.tr.code == kKeyMintGenerateKeyCode && !(c.tr.flags & TF_ONE_WAY) &&
-        IsKnownKeyMintHandle(c.tr.target.handle) && DataRegionSane(c.tr) &&
-        teesim_is_target_uid(static_cast<int32_t>(AIBinder_getCallingUid()))) {
-      gen_idx = static_cast<int>(i);
-      continue;  // candidate for takeover; not kept and not counted as "other"
+    if (c.cmd == BC_TRANSACTION && c.has_tr && hj_idx < 0) {
+      if (IsGenerateKeyHijack(c.tr)) {
+        hj_idx = static_cast<int>(i);
+        hj_kind = HijackKind::kGenerateKey;
+        continue;  // takeover candidate; not kept and not counted as "other"
+      }
+      if (IsRkpDenyTransaction(c.tr)) {
+        hj_idx = static_cast<int>(i);
+        hj_kind = HijackKind::kRkpDeny;
+        continue;
+      }
     }
     keep.push_back(i);
     ++other_cmds;
@@ -704,64 +843,35 @@ static HijackResult TryHijack(struct binder_write_read* bwr) {
 
   // We can only synthesise a reply when nothing else needs the kernel this round (writing BR_REPLY and
   // then letting the kernel run would clobber our read buffer). Otherwise fall back to excision/forward
-  // so the real generateKey still runs -- safe, just not taken over this time.
-  if (gen_idx >= 0 && other_cmds == 0) {
-    const struct binder_transaction_data& tr = cmds[gen_idx].tr;
-    AIBinder* local = GetLocalTee();
-    const size_t reply_hdr = sizeof(uint32_t) + sizeof(struct binder_transaction_data);
-    if (local && bwr->read_buffer != 0 && bwr->read_size >= reply_hdr) {
-      AParcel* out = nullptr;
-      binder_status_t st = CallLocalGenerateKey(local, tr, &out);
-      if (st == STATUS_OK && out) {
-        int32_t out_len = AParcel_getDataSize(out);
-        if (out_len >= 0) {
-          void* reply = std::malloc(out_len > 0 ? static_cast<size_t>(out_len) : 1);
-          bool marshalled = reply != nullptr &&
-              (out_len == 0 ||
-               AParcel_marshal(out, static_cast<uint8_t*>(reply), 0,
-                               static_cast<size_t>(out_len)) == STATUS_OK);
-          AParcel_delete(out);
-          if (marshalled) {
-            { std::lock_guard<std::mutex> lk(g_synth_mu); g_synth_bufs.insert(reinterpret_cast<uintptr_t>(reply)); }
-            // Compose BR_REPLY into the read buffer.
-            uint8_t* rb = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(bwr->read_buffer));
-            uint32_t br = BR_REPLY;
-            std::memcpy(rb, &br, sizeof(br));
-            struct binder_transaction_data rep;
-            std::memset(&rep, 0, sizeof(rep));
-            rep.code = 0;      // BR_REPLY carries no method code
-            rep.flags = 0;     // not oneway, no fds
-            rep.sender_euid = tr.sender_euid;  // preserve the caller's identity
-            rep.data_size = out_len;
-            rep.offsets_size = 0;
-            rep.data.ptr.buffer = static_cast<binder_uintptr_t>(reinterpret_cast<uintptr_t>(reply));
-            rep.data.ptr.offsets = 0;
-            std::memcpy(rb + sizeof(uint32_t), &rep, sizeof(rep));
-            bwr->read_consumed = reply_hdr;
-            // Release our stale reply buffers the client asked to free in the same write.
-            for (uintptr_t p : our_frees) {
-              std::lock_guard<std::mutex> lk(g_synth_mu);
-              if (g_synth_bufs.erase(p)) std::free(reinterpret_cast<void*>(p));
-            }
-            bwr->write_consumed = bwr->write_size;  // we consumed the whole write
-            LOGI("TEESIM_AVD_DIAG ioctl hijack: suppressed generateKey uid=%d handle=%u out=%d",
-                 static_cast<int>(AIBinder_getCallingUid()), tr.target.handle, out_len);
-            return HijackResult::kSuppress;
-          }
-          // malloc/marshal failed: drop the unregistered buffer and fall through to forward.
-          std::free(reply);
-        } else {
-          AParcel_delete(out);
-        }
-      } else if (out) {
-        AParcel_delete(out);
+  // so the real transaction still runs -- safe, just not taken over this time.
+  const size_t reply_hdr = sizeof(uint32_t) + sizeof(struct binder_transaction_data);
+  if (hj_idx >= 0 && other_cmds == 0 && bwr->read_buffer != 0 && bwr->read_size >= reply_hdr) {
+    const struct binder_transaction_data& tr = cmds[hj_idx].tr;
+    void* reply = nullptr;
+    int32_t out_len = 0;
+    const bool built = (hj_kind == HijackKind::kGenerateKey)
+                           ? BuildGenerateReply(tr, &reply, &out_len)
+                           : BuildRkpDenyReply(&reply, &out_len);
+    if (built) {
+      { std::lock_guard<std::mutex> lk(g_synth_mu); g_synth_bufs.insert(reinterpret_cast<uintptr_t>(reply)); }
+      EmitSynthReply(bwr, reply, out_len, tr.sender_euid, our_frees);
+      const int uid = static_cast<int>(AIBinder_getCallingUid());
+      if (hj_kind == HijackKind::kGenerateKey) {
+        LOGI("TEESIM_AVD_DIAG ioctl hijack: suppressed generateKey uid=%d handle=%u out=%d", uid,
+             tr.target.handle, out_len);
+      } else {
+        LOGI("DIAG hijack: rkp getRegistration denied uid=%d code=%u handle=%u", uid, tr.code,
+             tr.target.handle);
+        LOGI("TEESIM_AVD_DIAG ioctl hijack: suppressed rkp uid=%d code=%u handle=%u out=%d", uid,
+             tr.code, tr.target.handle, out_len);
       }
+      return HijackResult::kSuppress;
     }
   }
-  // Not suppressed (we returned above on success): any generateKey we identified must still reach the
-  // real HAL, so keep it in the forwarded stream rather than dropping it.
-  if (gen_idx >= 0) {
-    keep.push_back(static_cast<size_t>(gen_idx));
+  // Not suppressed (we returned above on success): any transaction we identified must still reach its
+  // real service, so keep it in the forwarded stream rather than dropping it.
+  if (hj_idx >= 0) {
+    keep.push_back(static_cast<size_t>(hj_idx));
     std::sort(keep.begin(), keep.end());
   }
 
@@ -777,7 +887,6 @@ static HijackResult TryHijack(struct binder_write_read* bwr) {
   }
   return HijackResult::kForwardUnchanged;
 }
-
 static int HookedIoctl(int fd, unsigned long req, void* arg) {
   {
     static std::atomic<uint32_t> n{0};
