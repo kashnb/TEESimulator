@@ -53,3 +53,16 @@ allow keystore adb_data_file file *
 # /data/local/tmp (shell_data_file) for that dlopen to succeed.
 allow keystore shell_data_file dir { search read open getattr }
 allow keystore shell_data_file file { read open getattr map execute }
+
+# --- KeyMint HAL-process injection (groundwork for moving the takeover into the HAL) -----------------
+# The inject binary (crash_dump domain) must PTRACE_ATTACH the KeyMint HAL process, and the HAL must
+# then dlopen the interceptor .so from /data/adb (adb_data_file), with the /data/local/tmp staging
+# path (shell_data_file) as the fd-passing fallback -- mirroring the keystore rules above. The domain
+# name is the AOSP default for the KeyMint HAL (hal_keymint_default); on a device that names its
+# KeyMint HAL domain differently these rules are inert (magiskpolicy skips unknown types) and injection
+# simply fails safe, which the hal-tx logs will show.
+allow crash_dump hal_keymint_default process *
+allow hal_keymint_default adb_data_file dir search
+allow hal_keymint_default adb_data_file file *
+allow hal_keymint_default shell_data_file dir { search read open getattr }
+allow hal_keymint_default shell_data_file file { read open getattr map execute }

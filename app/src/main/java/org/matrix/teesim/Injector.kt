@@ -24,6 +24,12 @@ class Injector(private val moduleDir: File) {
     @Volatile private var running = false
     @Volatile private var lastPid = -1
 
+    // The KeyMint HAL process (Android 12+). We inject the same lib with the same entry symbol; the
+    // lib detects it is the HAL and installs only a read-only diagnostic (see keymint_entry.cpp).
+    // Tracked separately from keystore2 so each is re-injected independently when its pid changes.
+    private val halProcName = "android.hardware.security.keymint-service"
+    @Volatile private var lastHalPid = -1
+
     fun start() {
         if (running) return
         running = true
@@ -76,6 +82,32 @@ class Injector(private val moduleDir: File) {
             } else if (pid <= 0) {
                 lastPid = -1 // process gone; force re-inject when it returns
             }
+            // Also inject the KeyMint HAL process (Android 12+ only). This is additive and
+            // independent of the keystore2 injection above; a failure here never affects keystore2.
+            if (api >= 31) {
+                val halPid =
+                    if (lastHalPid > 0 && isNamedProcess(lastHalPid, halProcName)) {
+                        lastHalPid
+                    } else {
+                        findPid(halProcName)
+                    }
+                if (halPid > 0 && halPid != lastHalPid) {
+                    if (inject(halPid)) {
+                        lastHalPid = halPid
+                        SystemLogger.info("Injector: injected into $halProcName pid=$halPid")
+                    } else {
+                        SystemLogger.warning(
+                            "Injector: injection into $halProcName pid=$halPid failed; will retry"
+                        )
+                    }
+                } else if (halPid <= 0) {
+                    if (lastHalPid > 0) {
+                        SystemLogger.debug("Injector: $halProcName gone; will re-inject when it returns")
+                    }
+                    lastHalPid = -1
+                }
+            }
+
             // Back off when injection keeps failing so we don't hammer a wedged keystore.
             sleep(if (failures > 3) 10000 else 2000)
         }

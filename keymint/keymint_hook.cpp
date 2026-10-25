@@ -480,6 +480,80 @@ static void AvdDiagScanBinderWrite(const struct binder_write_read* bwr) {
   }
 }
 
+// -----------------------------------------------------------------------------
+// HAL-process mode (groundwork for moving the KeyMint takeover into the HAL).
+//
+// When this lib is injected into the KeyMint HAL process (android.hardware.security.keymint-service)
+// instead of keystore2, we run a READ-ONLY diagnostic only: after each BINDER_WRITE_READ ioctl we
+// scan the *read* buffer for inbound BR_TRANSACTION commands and log the interface descriptor, the
+// transaction code, and the caller uid the HAL actually receives. Nothing is modified; the HAL's
+// behaviour is untouched. keystore2's own injection and code path are completely unaffected -- the
+// branch is selected per-process in entry() and recorded in g_hal_mode.
+static std::atomic<bool> g_hal_mode{false};
+
+// Bytes a single BR_ command occupies in a binder read buffer AFTER its 4-byte command word, or
+// (size_t)-1 for a command we do not model (caller then stops scanning). Read-only / best-effort.
+static size_t BrCmdPayloadSize(uint32_t cmd) {
+  switch (cmd) {
+    case BR_TRANSACTION:
+    case BR_REPLY:
+      return sizeof(struct binder_transaction_data);
+    case BR_TRANSACTION_SEC_CTX:
+      return sizeof(struct binder_transaction_data_secctx);
+    case BR_ACQUIRE_RESULT:
+    case BR_ERROR:
+      return sizeof(int32_t);
+    case BR_INCREFS:
+    case BR_ACQUIRE:
+    case BR_RELEASE:
+    case BR_DECREFS:
+      return sizeof(struct binder_ptr_cookie);
+    case BR_ATTEMPT_ACQUIRE:
+      return sizeof(struct binder_pri_ptr_cookie);
+    case BR_DEAD_BINDER:
+    case BR_CLEAR_DEATH_NOTIFICATION_DONE:
+      return sizeof(binder_uintptr_t);
+    case BR_OK:
+    case BR_DEAD_REPLY:
+    case BR_TRANSACTION_COMPLETE:
+    case BR_NOOP:
+    case BR_SPAWN_LOOPER:
+    case BR_FINISHED:
+    case BR_FAILED_REPLY:
+      return 0;
+    default:
+      return static_cast<size_t>(-1);  // unknown: stop scanning this buffer
+  }
+}
+
+// Scan a completed binder read buffer for inbound BR_TRANSACTION / BR_TRANSACTION_SEC_CTX and log a
+// capped `hal-tx:` line for each. Read-only; used only in g_hal_mode.
+static void HalDiagScanBinderRead(const struct binder_write_read* bwr) {
+  if (!bwr || bwr->read_consumed == 0 || bwr->read_buffer == 0) return;
+  const uint8_t* buf = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(bwr->read_buffer));
+  const size_t consumed = bwr->read_consumed;
+  size_t off = 0;
+  while (off + sizeof(uint32_t) <= consumed) {
+    uint32_t cmd = 0;
+    std::memcpy(&cmd, buf + off, sizeof(cmd));
+    off += sizeof(cmd);
+    if (cmd == BR_TRANSACTION || cmd == BR_TRANSACTION_SEC_CTX) {
+      if (off + sizeof(struct binder_transaction_data) > consumed) return;
+      struct binder_transaction_data tr;
+      std::memcpy(&tr, buf + off, sizeof(tr));
+      static std::atomic<int> hn{0};
+      int hi = hn.fetch_add(1, std::memory_order_relaxed);
+      if (hi < 64) {
+        LOGI("TEESIM_AVD_DIAG hal-tx: uid=%d code=%u desc=%s",
+             static_cast<int>(tr.sender_euid), tr.code, InterfaceName(tr).c_str());
+      }
+    }
+    size_t payload = BrCmdPayloadSize(cmd);
+    if (payload == static_cast<size_t>(-1)) return;  // unknown command; stop
+    off += payload;
+  }
+}
+
 // =============================================================================
 // A-plan: ioctl-level takeover of keystore2's KeyMint generateKey (code=3).
 //
@@ -932,6 +1006,14 @@ static HijackResult TryHijack(struct binder_write_read* bwr) {
   return HijackResult::kForwardUnchanged;
 }
 static int HookedIoctl(int fd, unsigned long req, void* arg) {
+  // HAL-process mode: read-only diagnostic. Run the real ioctl, then scan the read buffer for
+  // inbound transactions. Never touches keystore2's takeover logic below.
+  if (g_hal_mode.load(std::memory_order_relaxed)) {
+    int r = g_real_ioctl ? g_real_ioctl(fd, req, arg) : -1;
+    if (req == BINDER_WRITE_READ && arg != nullptr)
+      HalDiagScanBinderRead(static_cast<struct binder_write_read*>(arg));
+    return r;
+  }
   {
     static std::atomic<uint32_t> n{0};
     uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
@@ -1041,4 +1123,30 @@ extern "C" bool teesim_hook_install() {
   LOGI("teesim_hook_install: AIBinder_transact %s after full ELF scan",
        real_transact != nullptr ? "patched" : "not found (no importer)");
   return real_transact != nullptr;
+}
+
+// HAL-process install: read-only diagnostic only. Hooks `ioctl` (and `syscall`) across every
+// hookable ELF so inbound binder reads are visible regardless of which lib issues the syscall, then
+// sets g_hal_mode so HookedIoctl takes the read-only path. No AIBinder_transact hook, no RKP
+// snapshot, no local TA -- this round only confirms injection + which transactions the HAL receives.
+extern "C" bool teesim_hook_install_hal() {
+  g_hal_mode.store(true, std::memory_order_relaxed);
+  char exe_buf[512] = {0};
+  ssize_t n = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+  std::string exe = n > 0 ? std::string(exe_buf, n) : std::string();
+  const auto maps = lsplt::MapInfo::Scan();
+  std::set<std::pair<dev_t, ino_t>> seen;
+  for (const auto& m : maps) {
+    if (m.path.empty() || m.inode == 0) continue;
+    if (!IsHookableElf(m.path, exe)) continue;
+    if (!seen.insert({m.dev, m.inode}).second) continue;
+    lsplt::RegisterHook(m.dev, m.inode, "ioctl", reinterpret_cast<void*>(HookedIoctl),
+                        reinterpret_cast<void**>(&g_real_ioctl));
+    lsplt::RegisterHook(m.dev, m.inode, "syscall", reinterpret_cast<void*>(HookedSyscall),
+                        reinterpret_cast<void**>(&g_real_syscall));
+  }
+  lsplt::CommitHook();
+  LOGI("teesim_hook_install_hal: ioctl hook committed real_ioctl=%p real_syscall=%p",
+       reinterpret_cast<void*>(g_real_ioctl), reinterpret_cast<void*>(g_real_syscall));
+  return g_real_ioctl != nullptr;
 }
