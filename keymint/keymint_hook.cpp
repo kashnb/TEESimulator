@@ -13,6 +13,8 @@
 #include <android/binder_parcel.h>
 #include <android/binder_status.h>
 
+#include <linux/android/binder.h>
+#include <sys/ioctl.h>
 #include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
@@ -391,6 +393,50 @@ bool IsHookableElf(const std::string& path, const std::string& exe) {
   return path.compare(path.size() - 3, 3, ".so") == 0;
 }
 
+
+// TEESIM_AVD_DIAG: keystore2 on Android 16 is Rust and may drive binder through ioctl()
+// directly, bypassing the AIBinder_transact PLT hook. Log outgoing BC_TRANSACTION codes
+// (capped) so one CI run tells us which path the KeyMint calls really take.
+static int (*g_real_ioctl)(int, unsigned long, void*) = nullptr;
+
+static void AvdDiagScanBinderWrite(const struct binder_write_read* bwr) {
+  if (!bwr || bwr->write_size == 0 || bwr->write_buffer == 0) return;
+  const uint8_t* buf = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(bwr->write_buffer));
+  size_t off = 0;
+  while (off + sizeof(uint32_t) <= bwr->write_size) {
+    uint32_t cmd = 0;
+    memcpy(&cmd, buf + off, sizeof(cmd));
+    off += sizeof(cmd);
+    if (cmd == BC_TRANSACTION) {
+      if (off + sizeof(struct binder_transaction_data) > bwr->write_size) return;
+      struct binder_transaction_data tr;
+      memcpy(&tr, buf + off, sizeof(tr));
+      static std::atomic<uint32_t> n{0};
+      uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
+      if (i < 256) {
+        LOGI("TEESIM_AVD_DIAG ioctl BC_TRANSACTION#%u code=%u handle=%u ptr=%llx data=%llu", i,
+             tr.code, tr.target.handle, static_cast<unsigned long long>(tr.target.ptr),
+             static_cast<unsigned long long>(tr.data_size));
+      }
+      off += sizeof(tr) + ((tr.data_size + 7u) & ~static_cast<size_t>(7u));
+    } else if (cmd == BC_REPLY) {
+      if (off + sizeof(struct binder_transaction_data) > bwr->write_size) return;
+      struct binder_transaction_data tr;
+      memcpy(&tr, buf + off, sizeof(tr));
+      off += sizeof(tr) + ((tr.data_size + 7u) & ~static_cast<size_t>(7u));
+    } else {
+      return;
+    }
+  }
+}
+
+static int HookedIoctl(int fd, unsigned long req, void* arg) {
+  if (req == BINDER_WRITE_READ && arg != nullptr) {
+    AvdDiagScanBinderWrite(static_cast<struct binder_write_read*>(arg));
+  }
+  return g_real_ioctl ? g_real_ioctl(fd, req, arg) : -1;
+}
+
 extern "C" bool teesim_hook_install() {
   LogRkpPolicySnapshot();  // one-shot ground truth for the RKP-denial decisions HookedTransact makes
   char exe_buf[512] = {0};
@@ -407,9 +453,17 @@ extern "C" bool teesim_hook_install() {
       if (m.path.empty() || m.inode == 0) continue;
       if (exe_only ? (m.path != exe) : !IsHookableElf(m.path, exe)) continue;
       if (!seen.insert({m.dev, m.inode}).second) continue;
-      lsplt::RegisterHook(m.dev, m.inode, "AIBinder_transact",
+      bool diag_ok_tx = lsplt::RegisterHook(m.dev, m.inode, "AIBinder_transact",
                           reinterpret_cast<void*>(HookedTransact),
                           reinterpret_cast<void**>(&real_transact));
+      // TEESIM_AVD_DIAG: also hook ioctl so binder-rs traffic (if any) is visible.
+      bool diag_ok_io = lsplt::RegisterHook(m.dev, m.inode, "ioctl",
+                          reinterpret_cast<void*>(HookedIoctl),
+                          reinterpret_cast<void**>(&g_real_ioctl));
+      LOGI("TEESIM_AVD_DIAG install: %s reg_tx=%d reg_ioctl=%d real_tx=%p real_ioctl=%p",
+           m.path.c_str(), diag_ok_tx ? 1 : 0, diag_ok_io ? 1 : 0,
+           reinterpret_cast<void*>(real_transact),
+           reinterpret_cast<void*>(g_real_ioctl));
     }
     // CommitHook returns false when a probed module doesn't import the symbol, which is
     // expected; success is that the caller's slot was patched (backup set).
