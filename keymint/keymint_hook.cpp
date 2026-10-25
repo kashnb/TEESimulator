@@ -28,6 +28,10 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 // The subsystem every line from this file is stamped with; see injector/include/logging.hpp.
 #define LOG_SUB "km/hook"
@@ -432,6 +436,348 @@ static void AvdDiagScanBinderWrite(const struct binder_write_read* bwr) {
   }
 }
 
+// =============================================================================
+// A-plan: ioctl-level takeover of keystore2's KeyMint generateKey (code=3).
+//
+// keystore2's KeyMint traffic never reaches the AIBinder_transact PLT hook (keystore2 is Rust and
+// drives binder through ioctl(BINDER_WRITE_READ) in libbinder-rs), so we intercept it one layer down,
+// in HookedIoctl. The request bytes live out-of-line at tr.data.ptr.buffer; we rebuild them into an
+// NDK AParcel with AParcel_create/AParcel_unmarshal (both weak-linked and resolved at runtime against
+// keystore2's libbinder_ndk) and dispatch to a process-local TeesimKeyMintDevice, exactly like the
+// transact-hook path does via Redirect -- no android::Parcel / libbinder dependency is introduced.
+//
+// Phase 1 (always on): when a target app's generateKey is seen we build the parcel, call the local TA
+// read-only, and log `DIAG hijack: ...`. The transaction is NEVER modified; it always falls through to
+// g_real_ioctl. Phase 2 (synthesising a BR_REPLY and suppressing the real call) is written below but
+// gated behind the file switch /data/adb/teesim/ioctl_hijack.enable, which is absent by default, so
+// flipping it on (then restarting keystore2) enables takeover with no rebuild. The iron rule holds
+// throughout: any failure on any path forwards the ioctl unchanged.
+// =============================================================================
+
+// generateKey is FIRST_CALL_TRANSACTION + 2 == 3 for IKeyMintDevice (confirmed on-device).
+static constexpr uint32_t kKeyMintGenerateKeyCode = 3;
+// TRUSTED_ENVIRONMENT; the first-cut takeover treats every KeyMint handle as TEE (StrongBox is left
+// alone -- see the handle gate below -- until a level cache exists).
+static constexpr int32_t kSecurityLevelTee = 1;
+
+// Serialises the phase-2 write-buffer rewrite (keystore2 is multi-threaded; ioctl frequency is low).
+static std::mutex g_ioctl_mu;
+
+// handle -> is this a KeyMint binder. Populated by matching the AIDL interface token in the request
+// data against IKeyMintDevice::descriptor, so no handle is hardcoded (observed: 5/6 carry KeyMint, 1
+// is servicemanager).
+static std::mutex g_km_mu;
+static std::unordered_map<uint32_t, bool> g_km_handles;
+
+// Reply buffers we malloc'd and handed to the client inside a synthesised BR_REPLY. The client frees
+// them with BC_FREE_BUFFER, whose pointer the kernel would reject (EINVAL) -- so we intercept those
+// frees and release the memory ourselves.
+static std::mutex g_synth_mu;
+static std::unordered_set<uintptr_t> g_synth_bufs;
+
+// The process-local TEE device, built once (teesim_router_new_device runs a blocking getHardwareInfo
+// only when wrapping a real binder; here real=nullptr so it just makes a GENERATE-mode device).
+static AIBinder* g_local_tee = nullptr;
+static std::once_flag g_local_tee_once;
+static AIBinder* GetLocalTee() {
+  std::call_once(g_local_tee_once,
+                 [] { g_local_tee = teesim_router_new_device(kSecurityLevelTee, nullptr); });
+  return g_local_tee;
+}
+
+// Phase-2 master switch. Cached: toggling it takes effect on the next keystore2 start, like the spec.
+static bool HijackEnabled() {
+  static std::atomic<int> cached{-1};
+  int c = cached.load(std::memory_order_relaxed);
+  if (c < 0) {
+    c = access("/data/adb/teesim/ioctl_hijack.enable", F_OK) == 0 ? 1 : 0;
+    cached.store(c, std::memory_order_relaxed);
+  }
+  return c == 1;
+}
+
+// True if the first <=512 bytes of a request's data region contain the UTF-16 (little-endian) encoding
+// of IKeyMintDevice::descriptor. We search rather than assume a fixed offset, so a work-source or
+// other interface-header prefix ahead of the token does not defeat the match.
+static bool DataHasKeyMintInterface(const uint8_t* data, size_t len) {
+  const char* desc = IKeyMintDevice::descriptor;
+  const size_t dlen = desc ? std::strlen(desc) : 0;
+  if (dlen == 0) return false;
+  size_t scan = len < 512 ? len : 512;
+  if (scan < dlen * 2) return false;
+  for (size_t i = 0; i + dlen * 2 <= scan; i += 2) {
+    bool ok = true;
+    for (size_t j = 0; j < dlen; ++j) {
+      uint16_t ch = 0;
+      std::memcpy(&ch, data + i + j * 2, 2);
+      if (ch != static_cast<uint16_t>(static_cast<unsigned char>(desc[j]))) { ok = false; break; }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+static bool IsKnownKeyMintHandle(uint32_t handle) {
+  std::lock_guard<std::mutex> lk(g_km_mu);
+  auto it = g_km_handles.find(handle);
+  return it != g_km_handles.end() && it->second;
+}
+
+// Validity gate for a transaction's data region before we dereference tr.data.ptr.buffer.
+static bool DataRegionSane(const struct binder_transaction_data& tr) {
+  return tr.data.ptr.buffer != 0 && tr.data_size > 0 && tr.data_size < (1u << 20);
+}
+
+// Build an NDK AParcel bound to `local` holding the raw request bytes, dispatch generateKey to the
+// local TA through the unhooked AIBinder_transact backup, and return its reply parcel in *out (caller
+// deletes it). Returns STATUS_OK only when *out is set. The input parcel is consumed by the transact.
+static binder_status_t CallLocalGenerateKey(AIBinder* local, const struct binder_transaction_data& tr,
+                                            AParcel** out) {
+  *out = nullptr;
+  if (!real_transact) return STATUS_FAILED_TRANSACTION;  // no unhooked path to dispatch on
+  AParcel* in = nullptr;
+  // prepareTransaction yields an AParcel already associated with `local` (AIBinder_transact rejects a
+  // parcel bound to any other binder); unmarshal then replaces its data wholesale with the raw request
+  // bytes, leaving that association intact.
+  if (AIBinder_prepareTransaction(local, &in) != STATUS_OK || in == nullptr) {
+    return STATUS_FAILED_TRANSACTION;
+  }
+  const uint8_t* raw = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(tr.data.ptr.buffer));
+  if (AParcel_unmarshal(in, raw, tr.data_size) != STATUS_OK) {
+    AParcel_delete(in);
+    return STATUS_FAILED_TRANSACTION;
+  }
+  // The cast assumption underlying the whole scheme: the reconstructed parcel must be exactly the
+  // request size. If not, bail and let keystore2's real path run.
+  if (AParcel_getDataSize(in) != static_cast<int32_t>(tr.data_size)) {
+    AParcel_delete(in);
+    return STATUS_BAD_VALUE;
+  }
+  AParcel_setDataPosition(in, 0);
+  // Dispatch on the local device via the unhooked transact backup (as Redirect does), code=3, no
+  // oneway. real_transact consumes `in`.
+  return real_transact(local, kKeyMintGenerateKeyCode, &in, out, 0);
+}
+
+// Phase-1 read-only probe: prove the local TA answers this app's generateKey and emit one DIAG line.
+// Never alters the transaction.
+static void DiagProbeGenerateKey(const struct binder_transaction_data& tr) {
+  AIBinder* local = GetLocalTee();
+  const int uid = static_cast<int>(AIBinder_getCallingUid());
+  if (!local) {
+    LOGI("DIAG hijack: uid=%d handle=%u code=%u in=%d out=%d certs=%d (no local TEE device)", uid,
+         tr.target.handle, tr.code, static_cast<int>(tr.data_size), -1, -1);
+    return;
+  }
+  AParcel* out = nullptr;
+  binder_status_t st = CallLocalGenerateKey(local, tr, &out);
+  const int out_len = (st == STATUS_OK && out) ? AParcel_getDataSize(out) : -1;
+  // certs: parsing KeyCreationResult's chain out of the reply parcel is deferred; -1 == not parsed.
+  LOGI("DIAG hijack: uid=%d handle=%u code=%u in=%d out=%d certs=%d st=%d", uid, tr.target.handle,
+       tr.code, static_cast<int>(tr.data_size), out_len, -1, static_cast<int>(st));
+  if (out) AParcel_delete(out);
+}
+
+// One decoded command from a BINDER_WRITE_READ write buffer.
+struct WbCmd {
+  uint32_t cmd = 0;
+  size_t off = 0;        // offset of the command word within the write buffer
+  size_t len = 0;        // total bytes this command occupies (word + payload)
+  bool has_tr = false;   // BC_TRANSACTION / BC_REPLY payload present
+  struct binder_transaction_data tr {};
+  uintptr_t free_ptr = 0;  // BC_FREE_BUFFER argument
+};
+
+// Decode every command in a write buffer. Returns false (and leaves `out` partial) the moment an
+// unrecognised or truncated command is hit -- the caller then forwards unchanged, never guessing.
+// NOTE: in the command stream a BC_TRANSACTION is followed only by binder_transaction_data; the data
+// region is out-of-line at tr.data.ptr.buffer, so a command's length never includes tr.data_size.
+static bool DecodeWriteBuffer(const uint8_t* buf, size_t size, std::vector<WbCmd>* out) {
+  size_t off = 0;
+  while (off + sizeof(uint32_t) <= size) {
+    WbCmd c;
+    c.off = off;
+    std::memcpy(&c.cmd, buf + off, sizeof(uint32_t));
+    size_t p = off + sizeof(uint32_t);
+    if (c.cmd == BC_TRANSACTION || c.cmd == BC_REPLY) {
+      if (p + sizeof(struct binder_transaction_data) > size) return false;
+      std::memcpy(&c.tr, buf + p, sizeof(c.tr));
+      c.has_tr = true;
+      c.len = sizeof(uint32_t) + sizeof(struct binder_transaction_data);
+    } else if (c.cmd == BC_FREE_BUFFER) {
+      if (p + sizeof(binder_uintptr_t) > size) return false;
+      std::memcpy(&c.free_ptr, buf + p, sizeof(binder_uintptr_t));
+      c.len = sizeof(uint32_t) + sizeof(binder_uintptr_t);
+    } else {
+      return false;  // unknown command: stop, do not guess payload length
+    }
+    out->push_back(c);
+    off += c.len;
+  }
+  return off == size;  // whole buffer accounted for, cleanly
+}
+
+// Learn KeyMint handles from this write buffer and, when probing, run the phase-1 DIAG for each
+// target-app generateKey. Read-only; never touches the buffer.
+static void ScanKeyMintCache(const struct binder_write_read* bwr, bool do_probe) {
+  if (!bwr || bwr->write_buffer == 0 || bwr->write_size == 0) return;
+  const uint8_t* buf = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(bwr->write_buffer));
+  std::vector<WbCmd> cmds;
+  DecodeWriteBuffer(buf, bwr->write_size, &cmds);  // partial decode is fine for a read-only scan
+  for (const auto& c : cmds) {
+    if (c.cmd != BC_TRANSACTION || !c.has_tr) continue;
+    if (DataRegionSane(c.tr)) {
+      const uint8_t* d = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(c.tr.data.ptr.buffer));
+      if (DataHasKeyMintInterface(d, c.tr.data_size)) {
+        std::lock_guard<std::mutex> lk(g_km_mu);
+        g_km_handles[c.tr.target.handle] = true;
+      }
+    }
+    if (!do_probe) continue;
+    if (c.tr.code != kKeyMintGenerateKeyCode || (c.tr.flags & TF_ONE_WAY)) continue;
+    if (!IsKnownKeyMintHandle(c.tr.target.handle)) continue;
+    if (!teesim_is_target_uid(static_cast<int32_t>(AIBinder_getCallingUid()))) continue;
+    if (!DataRegionSane(c.tr)) continue;
+    DiagProbeGenerateKey(c.tr);
+  }
+}
+
+// Phase-2 outcome.
+enum class HijackResult {
+  kForwardUnchanged,  // leave bwr as-is, call the kernel
+  kForwardModified,   // bwr->write_size was shrunk (our BC_FREE_BUFFERs excised), call the kernel
+  kSuppress,          // reply synthesised; do NOT call the kernel
+};
+
+// Rebuild the write buffer keeping only the commands at the given indices, compacting in place, and
+// update write_size / write_consumed to match.
+static void RewriteWriteBuffer(struct binder_write_read* bwr, const std::vector<WbCmd>& cmds,
+                               const std::vector<size_t>& keep) {
+  uint8_t* buf = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(bwr->write_buffer));
+  size_t w = 0;
+  for (size_t idx : keep) {
+    const WbCmd& c = cmds[idx];
+    if (w != c.off) std::memmove(buf + w, buf + c.off, c.len);
+    w += c.len;
+  }
+  bwr->write_size = w;
+  bwr->write_consumed = w;
+}
+
+// Attempt phase-2 takeover. Caller holds g_ioctl_mu. Safe-by-construction: we only suppress when the
+// write buffer is nothing but (optionally) our own BC_FREE_BUFFERs plus exactly one target-app
+// generateKey whose reply we can synthesise into the read buffer; any other shape either just excises
+// our stale free-buffers (so the kernel never sees a pointer it rejects) or is forwarded untouched.
+static HijackResult TryHijack(struct binder_write_read* bwr) {
+  if (!bwr || bwr->write_buffer == 0 || bwr->write_size == 0) return HijackResult::kForwardUnchanged;
+  const uint8_t* buf = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(bwr->write_buffer));
+  std::vector<WbCmd> cmds;
+  if (!DecodeWriteBuffer(buf, bwr->write_size, &cmds) || cmds.empty()) {
+    return HijackResult::kForwardUnchanged;  // unparseable -> never meddle
+  }
+
+  std::vector<uintptr_t> our_frees;
+  std::vector<size_t> keep;  // indices to retain if we end up only excising frees
+  int gen_idx = -1;
+  int other_cmds = 0;  // non-free, non-the-one-gen commands
+
+  for (size_t i = 0; i < cmds.size(); ++i) {
+    const WbCmd& c = cmds[i];
+    if (c.cmd == BC_FREE_BUFFER) {
+      bool ours;
+      { std::lock_guard<std::mutex> lk(g_synth_mu); ours = g_synth_bufs.count(c.free_ptr) != 0; }
+      if (ours) { our_frees.push_back(c.free_ptr); continue; }  // excise ours
+      keep.push_back(i);  // a real free: must reach the kernel
+      ++other_cmds;
+      continue;
+    }
+    if (c.cmd == BC_TRANSACTION && c.has_tr && gen_idx < 0 &&
+        c.tr.code == kKeyMintGenerateKeyCode && !(c.tr.flags & TF_ONE_WAY) &&
+        IsKnownKeyMintHandle(c.tr.target.handle) && DataRegionSane(c.tr) &&
+        teesim_is_target_uid(static_cast<int32_t>(AIBinder_getCallingUid()))) {
+      gen_idx = static_cast<int>(i);
+      continue;  // candidate for takeover; not kept and not counted as "other"
+    }
+    keep.push_back(i);
+    ++other_cmds;
+  }
+
+  // We can only synthesise a reply when nothing else needs the kernel this round (writing BR_REPLY and
+  // then letting the kernel run would clobber our read buffer). Otherwise fall back to excision/forward
+  // so the real generateKey still runs -- safe, just not taken over this time.
+  if (gen_idx >= 0 && other_cmds == 0) {
+    const struct binder_transaction_data& tr = cmds[gen_idx].tr;
+    AIBinder* local = GetLocalTee();
+    const size_t reply_hdr = sizeof(uint32_t) + sizeof(struct binder_transaction_data);
+    if (local && bwr->read_buffer != 0 && bwr->read_size >= reply_hdr) {
+      AParcel* out = nullptr;
+      binder_status_t st = CallLocalGenerateKey(local, tr, &out);
+      if (st == STATUS_OK && out) {
+        int32_t out_len = AParcel_getDataSize(out);
+        if (out_len >= 0) {
+          void* reply = std::malloc(out_len > 0 ? static_cast<size_t>(out_len) : 1);
+          bool marshalled = reply != nullptr &&
+              (out_len == 0 ||
+               AParcel_marshal(out, static_cast<uint8_t*>(reply), 0,
+                               static_cast<size_t>(out_len)) == STATUS_OK);
+          AParcel_delete(out);
+          if (marshalled) {
+            { std::lock_guard<std::mutex> lk(g_synth_mu); g_synth_bufs.insert(reinterpret_cast<uintptr_t>(reply)); }
+            // Compose BR_REPLY into the read buffer.
+            uint8_t* rb = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(bwr->read_buffer));
+            uint32_t br = BR_REPLY;
+            std::memcpy(rb, &br, sizeof(br));
+            struct binder_transaction_data rep;
+            std::memset(&rep, 0, sizeof(rep));
+            rep.code = 0;      // BR_REPLY carries no method code
+            rep.flags = 0;     // not oneway, no fds
+            rep.sender_euid = tr.sender_euid;  // preserve the caller's identity
+            rep.data_size = out_len;
+            rep.offsets_size = 0;
+            rep.data.ptr.buffer = static_cast<binder_uintptr_t>(reinterpret_cast<uintptr_t>(reply));
+            rep.data.ptr.offsets = 0;
+            std::memcpy(rb + sizeof(uint32_t), &rep, sizeof(rep));
+            bwr->read_consumed = reply_hdr;
+            // Release our stale reply buffers the client asked to free in the same write.
+            for (uintptr_t p : our_frees) {
+              std::lock_guard<std::mutex> lk(g_synth_mu);
+              if (g_synth_bufs.erase(p)) std::free(reinterpret_cast<void*>(p));
+            }
+            bwr->write_consumed = bwr->write_size;  // we consumed the whole write
+            LOGI("TEESIM_AVD_DIAG ioctl hijack: suppressed generateKey uid=%d handle=%u out=%d",
+                 static_cast<int>(AIBinder_getCallingUid()), tr.target.handle, out_len);
+            return HijackResult::kSuppress;
+          }
+          // malloc/marshal failed: drop the unregistered buffer and fall through to forward.
+          std::free(reply);
+        } else {
+          AParcel_delete(out);
+        }
+      } else if (out) {
+        AParcel_delete(out);
+      }
+    }
+  }
+  // Not suppressed (we returned above on success): any generateKey we identified must still reach the
+  // real HAL, so keep it in the forwarded stream rather than dropping it.
+  if (gen_idx >= 0) {
+    keep.push_back(static_cast<size_t>(gen_idx));
+    std::sort(keep.begin(), keep.end());
+  }
+
+  // No suppression. If we identified any of our own BC_FREE_BUFFERs, excise them (the kernel would
+  // reject their pointers); otherwise forward byte-for-byte.
+  if (!our_frees.empty()) {
+    RewriteWriteBuffer(bwr, cmds, keep);
+    for (uintptr_t p : our_frees) {
+      std::lock_guard<std::mutex> lk(g_synth_mu);
+      if (g_synth_bufs.erase(p)) std::free(reinterpret_cast<void*>(p));
+    }
+    return HijackResult::kForwardModified;
+  }
+  return HijackResult::kForwardUnchanged;
+}
+
 static int HookedIoctl(int fd, unsigned long req, void* arg) {
   {
     static std::atomic<uint32_t> n{0};
@@ -439,7 +785,22 @@ static int HookedIoctl(int fd, unsigned long req, void* arg) {
     if (i < 32) LOGI("TEESIM_AVD_DIAG ioctl-call#%u fd=%d req=%#lx", i, fd, req);
   }
   if (req == BINDER_WRITE_READ && arg != nullptr) {
-    AvdDiagScanBinderWrite(static_cast<struct binder_write_read*>(arg));
+    auto* bwr = static_cast<struct binder_write_read*>(arg);
+    AvdDiagScanBinderWrite(bwr);  // keep the original BC_TRANSACTION trace intact
+    const bool hijack = HijackEnabled();
+    // Phase 1 (read-only): learn KeyMint handles and, when takeover is OFF, probe each generateKey.
+    ScanKeyMintCache(bwr, /*do_probe=*/!hijack);
+    // Phase 2 (gated OFF by default): take over generateKey at the ioctl layer.
+    if (hijack) {
+      std::lock_guard<std::mutex> lk(g_ioctl_mu);
+      switch (TryHijack(bwr)) {
+        case HijackResult::kSuppress:
+          return 0;  // reply already written into the read buffer; do not touch the kernel
+        case HijackResult::kForwardModified:
+        case HijackResult::kForwardUnchanged:
+          break;  // fall through to the real ioctl with (possibly) a shrunk write buffer
+      }
+    }
   }
   return g_real_ioctl ? g_real_ioctl(fd, req, arg) : -1;
 }
