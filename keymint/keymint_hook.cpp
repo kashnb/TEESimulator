@@ -14,6 +14,8 @@
 #include <android/binder_status.h>
 
 #include <linux/android/binder.h>
+#include <sys/syscall.h>
+#include <cstdarg>
 #include <sys/ioctl.h>
 #include <sys/system_properties.h>
 #include <time.h>
@@ -431,10 +433,45 @@ static void AvdDiagScanBinderWrite(const struct binder_write_read* bwr) {
 }
 
 static int HookedIoctl(int fd, unsigned long req, void* arg) {
+  {
+    static std::atomic<uint32_t> n{0};
+    uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
+    if (i < 32) LOGI("TEESIM_AVD_DIAG ioctl-call#%u fd=%d req=%#lx", i, fd, req);
+  }
   if (req == BINDER_WRITE_READ && arg != nullptr) {
     AvdDiagScanBinderWrite(static_cast<struct binder_write_read*>(arg));
   }
   return g_real_ioctl ? g_real_ioctl(fd, req, arg) : -1;
+}
+
+
+// TEESIM_AVD_DIAG: heartbeat for the ioctl hook (is it called at all?) and a syscall() hook,
+// because binder-rs may issue SYS_ioctl directly instead of calling libc's ioctl wrapper.
+static long (*g_real_syscall)(long, ...) = nullptr;
+
+static long HookedSyscall(long number, ...) {
+  va_list ap;
+  va_start(ap, number);
+  long a1 = va_arg(ap, long);
+  long a2 = va_arg(ap, long);
+  long a3 = va_arg(ap, long);
+  long a4 = va_arg(ap, long);
+  long a5 = va_arg(ap, long);
+  long a6 = va_arg(ap, long);
+  va_end(ap);
+  if (number == SYS_ioctl) {
+    static std::atomic<uint32_t> n{0};
+    uint32_t i = n.fetch_add(1, std::memory_order_relaxed);
+    if (i < 32) {
+      LOGI("TEESIM_AVD_DIAG syscall SYS_ioctl#%u fd=%ld req=%#lx", i, a1,
+           static_cast<unsigned long>(a2));
+    }
+    if (static_cast<unsigned long>(a2) == BINDER_WRITE_READ && a3 != 0) {
+      AvdDiagScanBinderWrite(reinterpret_cast<const struct binder_write_read*>(
+          static_cast<uintptr_t>(a3)));
+    }
+  }
+  return g_real_syscall ? g_real_syscall(number, a1, a2, a3, a4, a5, a6) : -1;
 }
 
 extern "C" bool teesim_hook_install() {
@@ -460,14 +497,18 @@ extern "C" bool teesim_hook_install() {
       bool diag_ok_io = lsplt::RegisterHook(m.dev, m.inode, "ioctl",
                           reinterpret_cast<void*>(HookedIoctl),
                           reinterpret_cast<void**>(&g_real_ioctl));
-      LOGI("TEESIM_AVD_DIAG install: %s reg_tx=%d reg_ioctl=%d real_tx=%p real_ioctl=%p",
-           m.path.c_str(), diag_ok_tx ? 1 : 0, diag_ok_io ? 1 : 0,
-           reinterpret_cast<void*>(real_transact),
-           reinterpret_cast<void*>(g_real_ioctl));
+      bool diag_ok_sc = lsplt::RegisterHook(m.dev, m.inode, "syscall",
+                          reinterpret_cast<void*>(HookedSyscall),
+                          reinterpret_cast<void**>(&g_real_syscall));
+      LOGI("TEESIM_AVD_DIAG install: %s reg_tx=%d reg_ioctl=%d reg_syscall=%d",
+           m.path.c_str(), diag_ok_tx ? 1 : 0, diag_ok_io ? 1 : 0, diag_ok_sc ? 1 : 0);
     }
     // CommitHook returns false when a probed module doesn't import the symbol, which is
     // expected; success is that the caller's slot was patched (backup set).
     lsplt::CommitHook();
+    LOGI("TEESIM_AVD_DIAG commit: real_tx=%p real_ioctl=%p real_syscall=%p",
+         reinterpret_cast<void*>(real_transact), reinterpret_cast<void*>(g_real_ioctl),
+         reinterpret_cast<void*>(g_real_syscall));
   };
 
   // The transaction we intercept — keystore2 forwarding to the real KeyMint — is issued from
