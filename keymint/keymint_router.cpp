@@ -1062,10 +1062,9 @@ class TeesimKeyMintDevice : public BnKeyMintDevice {
       LOGI("generateKey: foreign attest key (blob_len=%zu); forwarding to real HAL, no extra certs",
            attestationKey->keyBlob.size());
       if (!real_) {
-        // No real HAL to forward to (a device built without one). We cannot mint under a foreign
-        // attest key ourselves, so fail rather than dereference a null proxy.
-        LOGW("generateKey: foreign attest key but no real HAL; failing");
-        return NoRealHal(__func__);
+        // A 方案：没有真实 HAL 可转发时，忽略这个 foreign attest key，直接用 keybox 自签。
+        LOGI("TEESIM_AVD_DIAG self-attest under keybox (foreign attest key ignored)");
+        return Simulate(t.ta.get(), keyParams, std::nullopt, out);
       }
       ForwardGuard g;
       auto st = real_->generateKey(keyParams, attestationKey, out);
