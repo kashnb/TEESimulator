@@ -1154,9 +1154,15 @@ extern "C" bool teesim_hook_install_hal() {
 // =============================================================================
 // HAL-process takeover feasibility probe (pt28u, route-A groundwork).
 //
-// Gated behind /data/adb/teesim/hal_hijack.enable (default OFF, separate from keystore2's
-// ioctl_hijack.enable). When OFF, the HAL process keeps the previous round's read-only hal-tx
-// diagnostic exactly, and this probe does nothing.
+// Gated behind the system property persist.teesim.hal_hijack (default OFF / unset, separate from
+// keystore2's file switch /data/adb/teesim/ioctl_hijack.enable). A FILE switch under /data/adb is
+// invisible to the HAL: SELinux domain hal_keymint_default cannot access() KSU's /data/adb label,
+// so access() always fails and a file-gated probe would stay permanently OFF (confirmed canary-85).
+// System properties are readable from any domain via __system_property_get. The daemon (Injector
+// loop) mirrors the optional convenience file /data/adb/teesim/hal_hijack.enable into this property
+// via Magisk/KSU resetprop, so `touch`/`rm` of the file still works from a root shell. When OFF,
+// the HAL process keeps the previous round's read-only hal-tx diagnostic exactly, and this probe
+// does nothing.
 //
 // WHY THIS ROUND IS A PROBE, NOT A FULL TAKEOVER. Full route A -- re-registering our in-process
 // TeesimKeyMintDevice over "...IKeyMintDevice/default" so begin/update/finish run in the TA -- is
@@ -1191,8 +1197,15 @@ binder_exception_t AServiceManager_addService(AIBinder* binder, const char* inst
 bool AServiceManager_isDeclared(const char* instance);
 }
 
+// True when persist.teesim.hal_hijack is a non-empty value other than "0" (typically "1"). Unset /
+// empty / "0" are OFF. Readable from any SELinux domain; the daemon mirrors the optional file switch
+// into this property (see Injector.kt).
 static bool HalHijackEnabled() {
-  return access("/data/adb/teesim/hal_hijack.enable", F_OK) == 0;
+  char buf[PROP_VALUE_MAX] = {};
+  if (__system_property_get("persist.teesim.hal_hijack", buf) <= 0) return false;
+  if (buf[0] == '\0') return false;
+  if (buf[0] == '0' && buf[1] == '\0') return false;
+  return true;
 }
 
 // Capture the currently-registered real service `name`, log its identity, then re-add the SAME binder
@@ -1219,7 +1232,7 @@ static void HalProbeService(const char* name) {
 // Entry point for the detached probe thread. Safe/idempotent; honours the switch and the IRON RULE.
 extern "C" void teesim_hal_takeover_probe() {
   if (!HalHijackEnabled()) {
-    LOGI("TEESIM_AVD_DIAG hal-takeover: switch OFF (/data/adb/teesim/hal_hijack.enable absent); "
+    LOGI("TEESIM_AVD_DIAG hal-takeover: switch OFF (persist.teesim.hal_hijack unset/0); "
          "read-only hal-tx diagnostic only, real HAL untouched");
     return;
   }

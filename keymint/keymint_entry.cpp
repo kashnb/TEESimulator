@@ -23,7 +23,7 @@
 // keymint_hook.cpp
 extern "C" bool teesim_hook_install();      // keystore2 interceptor (full)
 extern "C" bool teesim_hook_install_hal();  // HAL-process read-only diagnostic
-// keymint_hook.cpp: gated (hal_hijack.enable) route-A addService-override feasibility probe.
+// keymint_hook.cpp: gated (persist.teesim.hal_hijack) route-A addService-override feasibility probe.
 extern "C" void teesim_hal_takeover_probe();
 
 // True when this process is the KeyMint HAL (basename of /proc/self/cmdline arg0 contains
@@ -47,7 +47,7 @@ extern "C" [[gnu::visibility("default")]] bool entry(void* /*handle*/) {
     LOGI("entry: KeyMint HAL diagnostic mode (read-only hal-tx trace)");
     bool ok = teesim_hook_install_hal();
     LOGI("entry: HAL ioctl hook installed=%d", ok);
-    // Route-A groundwork (gated behind /data/adb/teesim/hal_hijack.enable, default OFF): probe
+    // Route-A groundwork (gated behind persist.teesim.hal_hijack, default OFF): probe
     // addService-override feasibility on a DETACHED thread so AServiceManager_waitForService never
     // blocks the HAL's own service registration and entry() returns immediately. Switch-off and any
     // failure leave the real HAL untouched (IRON RULE).

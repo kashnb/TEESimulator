@@ -30,6 +30,15 @@ class Injector(private val moduleDir: File) {
     private val halProcName = "android.hardware.security.keymint-service"
     @Volatile private var lastHalPid = -1
 
+    // HAL-side hijack switch mirror. The HAL process (hal_keymint_default) cannot access() anything
+    // under /data/adb (SELinux / KSU file label), so the probe reads persist.teesim.hal_hijack via
+    // __system_property_get instead. This loop mirrors the optional convenience file
+    // /data/adb/teesim/hal_hijack.enable into that property so `touch`/`rm` still works from a root
+    // shell. Source of truth is the file; the property is the HAL-visible mirror (reset on each
+    // daemon boot from the file, so persist.* not surviving a reboot is fine).
+    private val halHijackFile = File(Const.DATA_DIR, "hal_hijack.enable")
+    @Volatile private var lastHalHijackSynced: String? = null
+
     fun start() {
         if (running) return
         running = true
@@ -50,6 +59,9 @@ class Injector(private val moduleDir: File) {
         SystemLogger.info("Injector: watching $procName (abi=$abi lib=$libName)")
         var failures = 0
         while (running) {
+            // Keep persist.teesim.hal_hijack in sync with the optional file switch so the HAL
+            // process (which cannot read /data/adb) sees the user's toggle. Cheap when unchanged.
+            syncHalHijackProp()
             // The full /proc walk in findPid touches every process's cmdline (~1000 reads on a
             // busy device); skip it while the pid we last injected is still alive, since it never
             // changes between keystore restarts. Fall back to the walk only once it's gone. The
@@ -206,6 +218,25 @@ class Injector(private val moduleDir: File) {
             if (base == name) return dir.name.toIntOrNull() ?: continue
         }
         return -1
+    }
+
+    /**
+     * Mirror `/data/adb/teesim/hal_hijack.enable` existence into `persist.teesim.hal_hijack`
+     * ("1"/"0") via [SysProp.set] (Magisk/KSU `resetprop -n`). Idempotent: only writes when the
+     * desired value differs from what we last successfully synced, so the 2s inject loop does not
+     * spam logs. Failure leaves [lastHalHijackSynced] untouched so the next tick retries.
+     */
+    private fun syncHalHijackProp() {
+        val on = halHijackFile.exists()
+        val value = if (on) "1" else "0"
+        if (value == lastHalHijackSynced) return
+        if (SysProp.set("persist.teesim.hal_hijack", value)) {
+            lastHalHijackSynced = value
+            SystemLogger.info(
+                "Injector: synced persist.teesim.hal_hijack=$value " +
+                    "(file ${if (on) "present" else "absent"})"
+            )
+        }
     }
 
     private fun sleep(ms: Long) {
