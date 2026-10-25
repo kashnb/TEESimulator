@@ -405,6 +405,38 @@ bool IsHookableElf(const std::string& path, const std::string& exe) {
 // (capped) so one CI run tells us which path the KeyMint calls really take.
 static int (*g_real_ioctl)(int, unsigned long, void*) = nullptr;
 
+// TEESIM_AVD_DIAG: extract the AIDL interface descriptor (length-prefixed UTF-16LE String16) from a
+// transaction's request data and return it as UTF-8, reusing the same request data region that
+// IsRkpDenyTransaction / DataHasInterface read. The interface token is a Parcel String16: a uint32
+// length (char count, excluding NUL) followed by length+1 UTF-16LE code units, preceded by header
+// words (strict-mode policy, optional work-source). We scan word-aligned for the first length word
+// whose units are all printable ASCII and contain a '.', which uniquely picks out the reverse-DNS
+// descriptor. Read-only; returns "?" when no token is found.
+static std::string InterfaceName(const struct binder_transaction_data& tr) {
+  if (tr.data.ptr.buffer == 0 || tr.data_size == 0 || tr.data_size >= (1u << 20)) return "?";
+  const uint8_t* d = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(tr.data.ptr.buffer));
+  size_t scan = tr.data_size < 512 ? tr.data_size : 512;
+  for (size_t i = 0; i + sizeof(uint32_t) <= scan; i += sizeof(uint32_t)) {
+    uint32_t len = 0;
+    std::memcpy(&len, d + i, sizeof(len));
+    if (len == 0 || len > 128) continue;
+    size_t bytes = static_cast<size_t>(len) * 2;
+    if (i + sizeof(uint32_t) + bytes > scan) continue;
+    const uint8_t* srep = d + i + sizeof(uint32_t);
+    std::string out;
+    bool ok = true, has_dot = false;
+    for (uint32_t j = 0; j < len; ++j) {
+      uint16_t ch = 0;
+      std::memcpy(&ch, srep + j * 2, 2);
+      if (ch < 0x20 || ch > 0x7e) { ok = false; break; }
+      if (ch == static_cast<uint16_t>('.')) has_dot = true;
+      out.push_back(static_cast<char>(ch));
+    }
+    if (ok && has_dot) return out;
+  }
+  return "?";
+}
+
 static void AvdDiagScanBinderWrite(const struct binder_write_read* bwr) {
   if (!bwr || bwr->write_size == 0 || bwr->write_buffer == 0) return;
   const uint8_t* buf = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(bwr->write_buffer));
@@ -423,6 +455,18 @@ static void AvdDiagScanBinderWrite(const struct binder_write_read* bwr) {
         LOGI("TEESIM_AVD_DIAG ioctl BC_TRANSACTION#%u code=%u handle=%u ptr=%llx data=%llu", i,
              tr.code, tr.target.handle, static_cast<unsigned long long>(tr.target.ptr),
              static_cast<unsigned long long>(tr.data_size));
+      }
+      // Temporary diagnostic (pt24u): for each successfully parsed BC_TRANSACTION, log interface
+      // descriptor, code, caller uid and target handle. Capped at 64 via its own counter; always on,
+      // independent of the phase-2 switch. Pure read-only; changes no behaviour.
+      {
+        static std::atomic<int> dn{0};
+        int di = dn.fetch_add(1, std::memory_order_relaxed);
+        if (di < 64) {
+          LOGI("TEESIM_AVD_DIAG tx: uid=%d handle=%u code=%u desc=%s",
+               static_cast<int>(AIBinder_getCallingUid()), tr.target.handle, tr.code,
+               InterfaceName(tr).c_str());
+        }
       }
       off += sizeof(tr) + ((tr.data_size + 7u) & ~static_cast<size_t>(7u));
     } else if (cmd == BC_REPLY) {
