@@ -1150,3 +1150,84 @@ extern "C" bool teesim_hook_install_hal() {
        reinterpret_cast<void*>(g_real_ioctl), reinterpret_cast<void*>(g_real_syscall));
   return g_real_ioctl != nullptr;
 }
+
+// =============================================================================
+// HAL-process takeover feasibility probe (pt28u, route-A groundwork).
+//
+// Gated behind /data/adb/teesim/hal_hijack.enable (default OFF, separate from keystore2's
+// ioctl_hijack.enable). When OFF, the HAL process keeps the previous round's read-only hal-tx
+// diagnostic exactly, and this probe does nothing.
+//
+// WHY THIS ROUND IS A PROBE, NOT A FULL TAKEOVER. Full route A -- re-registering our in-process
+// TeesimKeyMintDevice over "...IKeyMintDevice/default" so begin/update/finish run in the TA -- is
+// blocked on two things this round cannot solve in the HAL-lib alone, both confirmed by reading the
+// tree:
+//   1. NO KEYBOX/PROFILES IN THE HAL PROCESS. The TA's keybox + profile set arrive only via the
+//      daemon's control push over a FILESYSTEM unix socket at /data/misc/keystore/.teesim-ctl, inside
+//      keystore's 0700 keystore_data_file dir (see common/control.cpp kSocketPath). The HAL runs as
+//      hal_keymint_default and cannot bind/serve there, and the daemon only connects to keystore2's
+//      socket -- so a TeesimKeyMintDevice built here would have g_profiles empty and every generateKey
+//      would just forward to the real HAL. Provisioning the HAL-process TA needs a new socket path +
+//      daemon + sepolicy change (cross-component), not a router tweak.
+//   2. ATTRIBUTION. The HAL sees AIBinder_getCallingUid()==1017 (keystore2) for every IKeyMintDevice
+//      call; the app uid is NOT a parameter of the KeyMint HAL generateKey AIDL, so ProfileForRequest
+//      (keyed on app uids) can't match. Picking targets in the HAL needs a different signal
+//      (e.g. ATTESTATION_APPLICATION_ID), also a design change.
+// So we do NOT replace the real service this round. We answer the ONE gating question route A needs
+// first -- can hal_keymint_default re-register the KeyMint service name at all (servicemanager / VINTF
+// / SELinux `add`)? -- by re-adding the SAME real binder under the same name. That is idempotent
+// (servicemanager maps the name to the identical kernel node), so the real HAL is never disturbed
+// (IRON RULE), and the returned status tells us whether a future override would be permitted here.
+//
+// Runs on a detached thread (entry.cpp) so AServiceManager_waitForService never blocks the HAL's own
+// service registration, and so entry() returns immediately.
+
+// Declared locally (not via <android/binder_manager.h>) to dodge the NDK header's __INTRODUCED_IN
+// availability guards: the module's C++ floor is API 29, but HAL injection is API>=31 only, so these
+// resolve at runtime against the HAL's own libbinder_ndk (the lib links -Wl,-z,undefs).
+extern "C" {
+AIBinder* AServiceManager_waitForService(const char* instance);
+binder_exception_t AServiceManager_addService(AIBinder* binder, const char* instance);
+bool AServiceManager_isDeclared(const char* instance);
+}
+
+static bool HalHijackEnabled() {
+  return access("/data/adb/teesim/hal_hijack.enable", F_OK) == 0;
+}
+
+// Capture the currently-registered real service `name`, log its identity, then re-add the SAME binder
+// under the same name to probe whether an override would be permitted. Idempotent: no behaviour change.
+static void HalProbeService(const char* name) {
+  AIBinder* real = AServiceManager_waitForService(name);  // blocks until the real HAL registered it
+  if (real == nullptr) {
+    LOGW("TEESIM_AVD_DIAG hal-takeover: waitForService(%s) returned null; cannot probe override", name);
+    return;
+  }
+  const bool declared = AServiceManager_isDeclared(name);
+  LOGI("TEESIM_AVD_DIAG hal-takeover: captured real service %s binder=%p remote=%d declared=%d", name,
+       reinterpret_cast<void*>(real), AIBinder_isRemote(real) ? 1 : 0, declared ? 1 : 0);
+  // Re-register the SAME real binder: functionally a no-op (same kernel node), but the status answers
+  // "would servicemanager + SELinux let us register OUR device under this name in route A?".
+  binder_exception_t add = AServiceManager_addService(real, name);
+  LOGI("TEESIM_AVD_DIAG hal-takeover: re-addService(%s, real-binder) status=%d -- route-A override %s",
+       name, static_cast<int>(add),
+       add == EX_NONE ? "PERMITTED (servicemanager/SELinux allow same-name add in hal_keymint_default)"
+                      : "BLOCKED (would need a sepolicy/VINTF change before route A)");
+  AIBinder_decStrong(real);
+}
+
+// Entry point for the detached probe thread. Safe/idempotent; honours the switch and the IRON RULE.
+extern "C" void teesim_hal_takeover_probe() {
+  if (!HalHijackEnabled()) {
+    LOGI("TEESIM_AVD_DIAG hal-takeover: switch OFF (/data/adb/teesim/hal_hijack.enable absent); "
+         "read-only hal-tx diagnostic only, real HAL untouched");
+    return;
+  }
+  LOGI("TEESIM_AVD_DIAG hal-takeover: switch ON; probing addService-override feasibility "
+       "(idempotent re-add of the real binder; real HAL NOT replaced this round)");
+  HalProbeService("android.hardware.security.keymint.IKeyMintDevice/default");
+  HalProbeService("android.hardware.security.keymint.IRemotelyProvisionedComponent/default");
+  LOGI("TEESIM_AVD_DIAG hal-takeover: probe done. Full takeover is blocked on HAL-process keybox "
+       "provisioning + caller attribution (see keymint_hook.cpp notes); next round wires those if the "
+       "re-addService status above is PERMITTED.");
+}
